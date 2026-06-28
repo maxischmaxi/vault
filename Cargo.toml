@@ -1,0 +1,17 @@
+[package]
+name = "vault"
+version = "0.1.0"
+edition = "2021"
+description = "Encrypted secret manager with shell environment injection"
+authors = ["maxischmaxi"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+dirs = "6"
+age = "0.11"
+rpassword = "7"
+
+[profile.release]
+opt-level = 2
+strip = true
