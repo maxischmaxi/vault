@@ -15,14 +15,14 @@ if [[ ! -x "$VAULT_BIN" ]]; then
 fi
 
 # ── Wrapper function ───────────────────────────────────────────────────
-# After any mutating command (edit/add/rm/init), automatically reload
+# After any mutating command (edit/add/rm/init/pull), automatically reload
 # secrets into the current shell environment. This gives you on-the-fly
 # updates: edit in vim → save → env is instantly updated.
 vault() {
     "$VAULT_BIN" "$@"
     local ret=$?
     case "$1" in
-        edit|add|rm|init)
+        edit|add|rm|init|pull)
             eval "$("$VAULT_BIN" env 2>/dev/null)"
             ;;
     esac

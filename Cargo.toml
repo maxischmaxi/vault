@@ -12,6 +12,8 @@ dirs = "6"
 age = "0.11"
 rpassword = "7"
 clap_complete = "4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [profile.release]
 opt-level = 2

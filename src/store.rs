@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub struct Store {
@@ -28,6 +28,26 @@ impl Store {
             store_path: dir.join("store.env.age"),
             dir,
         })
+    }
+
+    /// Directory holding vault data (key, store, remotes config).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Path to the encrypted store.
+    pub fn store_path(&self) -> &Path {
+        &self.store_path
+    }
+
+    /// Path to the age identity key.
+    pub fn key_path(&self) -> &Path {
+        &self.key_path
+    }
+
+    /// Path to the remotes configuration file.
+    pub fn remotes_config_path(&self) -> PathBuf {
+        self.dir.join("remotes.toml")
     }
 
     // ── Key / crypto helpers ───────────────────────────────────────────
@@ -123,7 +143,7 @@ impl Store {
         Ok(())
     }
 
-    fn ensure_init(&self) -> Result<()> {
+    pub fn ensure_init(&self) -> Result<()> {
         if !self.key_path.exists() {
             bail!("Vault not initialized. Run: vault init");
         }
