@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 
 mod store;
 
@@ -52,10 +53,24 @@ enum Commands {
 
     /// Print decrypted store contents (raw)
     Cat,
+
+    /// Generate shell completion script
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Handle completions before creating the store (no vault needed)
+    if let Commands::Completions { shell } = cli.command {
+        let mut cmd = Cli::command();
+        generate(shell, &mut cmd, "vault", &mut std::io::stdout());
+        return Ok(());
+    }
+
     let store = store::Store::new()?;
 
     match cli.command {
@@ -67,6 +82,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Rm { key } => store.remove(&key)?,
         Commands::Env => store.env()?,
         Commands::Cat => store.cat()?,
+        Commands::Completions { .. } => unreachable!(),
     }
 
     Ok(())

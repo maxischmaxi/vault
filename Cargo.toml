@@ -11,6 +11,7 @@ anyhow = "1"
 dirs = "6"
 age = "0.11"
 rpassword = "7"
+clap_complete = "4"
 
 [profile.release]
 opt-level = 2
