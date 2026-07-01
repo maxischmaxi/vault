@@ -37,6 +37,31 @@ pub struct Remote {
     pub path: String,
 }
 
+impl Remote {
+    /// Reject values that ssh would parse as options (leading '-') or that
+    /// would garble the user@host target.
+    pub fn validate(&self) -> Result<()> {
+        for (label, v) in [("name", &self.name), ("host", &self.host), ("user", &self.user)] {
+            if v.is_empty() {
+                bail!("Remote {label} must not be empty");
+            }
+            if v.starts_with('-') {
+                bail!("Remote {label} must not start with '-'");
+            }
+            if v.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                bail!("Remote {label} must not contain whitespace");
+            }
+        }
+        if self.host.contains('@') || self.user.contains('@') {
+            bail!("Remote host/user must not contain '@'");
+        }
+        if self.path.is_empty() {
+            bail!("Remote path must not be empty");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RemotesConfig {
     #[serde(default)]
@@ -61,6 +86,8 @@ impl RemotesConfig {
             .map_err(|e| anyhow::anyhow!("Failed to serialize remotes config: {e}"))?;
         fs::write(config_path, toml_str)
             .with_context(|| format!("Cannot write remotes config to {}", config_path.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(config_path, PermissionsExt::from_mode(0o600))?;
         Ok(())
     }
 }
@@ -89,6 +116,7 @@ impl RemoteManager {
     }
 
     pub fn add(&self, remote: Remote) -> Result<()> {
+        remote.validate()?;
         let mut remotes = self.load()?;
         if remotes.iter().any(|r| r.name == remote.name) {
             bail!(
@@ -116,19 +144,40 @@ impl RemoteManager {
 
 // ── Push / Pull ────────────────────────────────────────────────────────
 
-/// Push the encrypted store (and optionally the age key) to a remote.
-/// The store is already encrypted with age — SSH provides the transport.
-pub fn push(remote: &Remote, store_path: &Path, key_path: &Path, include_key: bool) -> Result<()> {
+/// Remote path of the passphrase-encrypted key backup, next to the store.
+fn key_backup_path(store_path: &str) -> String {
+    format!("{store_path}.key.age")
+}
+
+/// Push the encrypted store (and optionally the passphrase-encrypted age
+/// key) to a remote. The store is already encrypted with age — SSH provides
+/// the transport.
+pub fn push(remote: &Remote, store_path: &Path, key_ciphertext: Option<&[u8]>) -> Result<()> {
     match remote.remote_type {
-        RemoteType::Ssh => push_ssh(remote, store_path, key_path, include_key),
+        RemoteType::Ssh => push_ssh(remote, store_path, key_ciphertext),
         RemoteType::Ftp => bail!("FTP remotes are not yet implemented. Use type ssh for now."),
     }
 }
 
-/// Pull the encrypted store from a remote, overwriting the local store.
-pub fn pull(remote: &Remote, store_path: &Path) -> Result<()> {
+/// Download the remote store into a temp file next to `store_path`.
+/// Returns the temp path — the caller verifies it decrypts, then renames it
+/// over the real store. The local store is never touched here.
+pub fn pull(remote: &Remote, store_path: &Path) -> Result<PathBuf> {
     match remote.remote_type {
-        RemoteType::Ssh => pull_ssh(remote, store_path),
+        RemoteType::Ssh => {
+            let data = ssh_read(remote, &remote.path)?;
+            let tmp = PathBuf::from(format!("{}.pull-tmp", store_path.display()));
+            crate::store::write_private(&tmp, &data)?;
+            Ok(tmp)
+        }
+        RemoteType::Ftp => bail!("FTP remotes are not yet implemented. Use type ssh for now."),
+    }
+}
+
+/// Download the passphrase-encrypted key backup from a remote.
+pub fn pull_key(remote: &Remote) -> Result<Vec<u8>> {
+    match remote.remote_type {
+        RemoteType::Ssh => ssh_read(remote, &key_backup_path(&remote.path)),
         RemoteType::Ftp => bail!("FTP remotes are not yet implemented. Use type ssh for now."),
     }
 }
@@ -157,6 +206,7 @@ fn ssh_opts(remote: &Remote) -> Vec<String> {
 fn ssh_exec(remote: &Remote, remote_cmd: &str) -> Result<()> {
     let status = Command::new("ssh")
         .args(ssh_opts(remote))
+        .arg("--")
         .arg(ssh_target(remote))
         .arg(remote_cmd)
         .status()
@@ -184,12 +234,15 @@ fn sq(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
-/// Pipe a local file to a remote path via `ssh host "cat > 'path'"`.
-/// This avoids scp's remote-path quoting pitfalls entirely.
-fn ssh_put(remote: &Remote, local_path: &Path, remote_path: &str) -> Result<()> {
-    let remote_cmd = format!("cat > '{}'", sq(remote_path));
+/// Pipe bytes to a remote path via `ssh host "umask 077 && cat > 'path'"`.
+/// This avoids scp's remote-path quoting pitfalls entirely. The umask makes
+/// new files owner-only from creation; chmod covers pre-existing files.
+fn ssh_put_bytes(remote: &Remote, data: &[u8], remote_path: &str) -> Result<()> {
+    let quoted = sq(remote_path);
+    let remote_cmd = format!("umask 077 && cat > '{quoted}' && chmod 600 '{quoted}'");
     let mut child = Command::new("ssh")
         .args(ssh_opts(remote))
+        .arg("--")
         .arg(ssh_target(remote))
         .arg(&remote_cmd)
         .stdin(Stdio::piped())
@@ -198,10 +251,8 @@ fn ssh_put(remote: &Remote, local_path: &Path, remote_path: &str) -> Result<()> 
 
     {
         let mut input = child.stdin.take().context("no stdin")?;
-        let data = fs::read(local_path)
-            .with_context(|| format!("Cannot read {}", local_path.display()))?;
         input
-            .write_all(&data)
+            .write_all(data)
             .with_context(|| format!("Failed to pipe file to ssh for {}", remote.name))?;
     } // dropping stdin closes it, signalling EOF to remote `cat`
 
@@ -218,25 +269,27 @@ fn ssh_put(remote: &Remote, local_path: &Path, remote_path: &str) -> Result<()> 
     Ok(())
 }
 
-/// Pull a remote path into a local file via `ssh host "cat 'path'"`.
-fn ssh_get(remote: &Remote, remote_path: &str, local_path: &Path) -> Result<()> {
+/// Read a remote path via `ssh host "cat 'path'"`, returning its bytes.
+/// The exit status is checked before the data is handed to the caller, so a
+/// failed `cat` can never masquerade as an empty file.
+fn ssh_read(remote: &Remote, remote_path: &str) -> Result<Vec<u8>> {
     let remote_cmd = format!("cat '{}'", sq(remote_path));
     let mut child = Command::new("ssh")
         .args(ssh_opts(remote))
+        .arg("--")
         .arg(ssh_target(remote))
         .arg(&remote_cmd)
         .stdout(Stdio::piped())
         .spawn()
         .with_context(|| format!("Failed to spawn ssh for {}", remote.name))?;
 
-    {
-        let mut out = child.stdout.take().context("no stdout")?;
-        let mut buf = Vec::new();
-        out.read_to_end(&mut buf)
-            .with_context(|| format!("Failed to read remote file from {}", remote.name))?;
-        fs::write(local_path, &buf)
-            .with_context(|| format!("Cannot write {}", local_path.display()))?;
-    }
+    let mut buf = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("no stdout")?
+        .read_to_end(&mut buf)
+        .with_context(|| format!("Failed to read remote file from {}", remote.name))?;
 
     let status = child
         .wait()
@@ -248,15 +301,10 @@ fn ssh_get(remote: &Remote, remote_path: &str, local_path: &Path) -> Result<()> 
             status.code()
         );
     }
-    Ok(())
+    Ok(buf)
 }
 
-fn push_ssh(
-    remote: &Remote,
-    store_path: &Path,
-    key_path: &Path,
-    include_key: bool,
-) -> Result<()> {
+fn push_ssh(remote: &Remote, store_path: &Path, key_ciphertext: Option<&[u8]>) -> Result<()> {
     if !store_path.exists() {
         bail!(
             "Encrypted store not found at {}. Run `vault init` first.",
@@ -271,7 +319,9 @@ fn push_ssh(
         .with_context(|| format!("Failed to create remote directory on '{}'", remote.name))?;
 
     // Upload the encrypted store.
-    ssh_put(remote, store_path, &remote.path)?;
+    let store_data = fs::read(store_path)
+        .with_context(|| format!("Cannot read {}", store_path.display()))?;
+    ssh_put_bytes(remote, &store_data, &remote.path)?;
     eprintln!(
         "✓ Pushed encrypted store to '{}' → {}:{}",
         remote.name,
@@ -279,36 +329,17 @@ fn push_ssh(
         remote.path
     );
 
-    if include_key {
-        if !key_path.exists() {
-            bail!(
-                "Key file not found at {}. Cannot include key.",
-                key_path.display()
-            );
-        }
-        let key_remote_path = format!("{}.key", remote.path);
-        ssh_put(remote, key_path, &key_remote_path)?;
+    if let Some(ciphertext) = key_ciphertext {
+        let key_remote_path = key_backup_path(&remote.path);
+        ssh_put_bytes(remote, ciphertext, &key_remote_path)?;
         eprintln!(
-            "✓ Pushed age key to '{}' → {}:{}",
+            "✓ Pushed passphrase-encrypted age key to '{}' → {}:{}",
             remote.name,
             ssh_target(remote),
             key_remote_path
         );
     }
 
-    Ok(())
-}
-
-fn pull_ssh(remote: &Remote, store_path: &Path) -> Result<()> {
-    ssh_get(remote, &remote.path, store_path)?;
-    // Restore restrictive permissions on the pulled store.
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(store_path, PermissionsExt::from_mode(0o600))?;
-    eprintln!(
-        "✓ Pulled encrypted store from '{}' → {}",
-        remote.name,
-        store_path.display()
-    );
     Ok(())
 }
 
@@ -348,6 +379,39 @@ mod tests {
         assert_eq!(parsed.remote[0].name, "nas");
         assert_eq!(parsed.remote[0].remote_type, RemoteType::Ssh);
         assert_eq!(parsed.remote[0].port, Some(22));
+    }
+
+    #[test]
+    fn test_remote_validation() {
+        let base = Remote {
+            name: "nas".to_string(),
+            remote_type: RemoteType::Ssh,
+            host: "nas.local".to_string(),
+            user: "backup".to_string(),
+            port: None,
+            path: "/volume1/vault/store.env.age".to_string(),
+        };
+        assert!(base.validate().is_ok());
+
+        let mut r = base.clone();
+        r.host = "-oProxyCommand=evil".to_string();
+        assert!(r.validate().is_err());
+
+        let mut r = base.clone();
+        r.user = "user name".to_string();
+        assert!(r.validate().is_err());
+
+        let mut r = base.clone();
+        r.host = "evil@host".to_string();
+        assert!(r.validate().is_err());
+
+        let mut r = base.clone();
+        r.name = String::new();
+        assert!(r.validate().is_err());
+
+        let mut r = base;
+        r.path = String::new();
+        assert!(r.validate().is_err());
     }
 
     #[test]

@@ -34,10 +34,10 @@ This generates an age keypair at `~/.local/share/vault/key.txt` and creates an e
 ### 2. Add secrets
 
 ```sh
-# Interactive (hidden input)
+# Interactive (hidden input) — preferred
 vault add OPENAI_API_KEY
 
-# Or pass directly
+# Or pass directly — note: the value lands in your shell history!
 vault add GITHUB_TOKEN ghp_xxxxxxxxxxxx
 ```
 
@@ -84,6 +84,7 @@ This gives you:
 | `vault remote rm NAME` | Remove a remote |
 | `vault push [REMOTE] [--include-key]` | Push encrypted store to one or all remotes |
 | `vault pull REMOTE` | Pull & restore the encrypted store from a remote |
+| `vault key restore REMOTE` | Restore the age key from a passphrase-encrypted remote backup |
 
 ## How it works
 
@@ -133,7 +134,8 @@ vault push
 # Push to a specific remote
 vault push nas
 
-# Also back up the age key (needed to restore on a fresh machine — keep safe!)
+# Also back up the age key — it is encrypted with a passphrase (age scrypt)
+# before upload, so the remote never sees plaintext key material.
 vault push --include-key
 ```
 
@@ -147,6 +149,9 @@ so it relies on your existing SSH keys / `~/.ssh/config` — no passwords, no ex
 vault pull nas
 ```
 
+The pulled store is only installed after vault verifies it decrypts with the
+local key — a failed download or a foreign store can never clobber your local copy.
+
 After a `pull`, the zsh wrapper automatically reloads the env.
 
 ### Disaster recovery
@@ -154,12 +159,12 @@ After a `pull`, the zsh wrapper automatically reloads the env.
 If your machine dies, restore on a fresh box:
 
 ```sh
-vault init                      # creates a new key + empty store
-# pull the backed-up key + store, then overwrite:
-vault pull nas                  # overwrites store with the remote copy
-# if you backed up the key with --include-key, restore it manually:
-scp nas:/volume1/vault/store.env.age.key ~/.local/share/vault/key.txt
-chmod 600 ~/.local/share/vault/key.txt
+vault remote add nas --type ssh --host nas.local \
+  --user backup --path /volume1/vault/store.env.age
+
+vault key restore nas           # downloads store.env.age.key.age, asks for the
+                                # backup passphrase, installs key.txt (0600)
+vault pull nas                  # restores the encrypted store
 vault list                      # secrets are back
 ```
 

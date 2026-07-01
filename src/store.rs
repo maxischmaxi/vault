@@ -1,13 +1,13 @@
 use anyhow::{bail, Context, Result};
 use age::{
     Decryptor, Encryptor,
-    secrecy::ExposeSecret,
+    secrecy::{ExposeSecret, SecretString},
     x25519::{Identity, Recipient},
 };
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -50,6 +50,18 @@ impl Store {
         self.dir.join("remotes.toml")
     }
 
+    /// Create the vault directory owner-only (0700) if it doesn't exist yet.
+    pub fn ensure_dir(&self) -> Result<()> {
+        if !self.dir.exists() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.dir)
+                .with_context(|| format!("Cannot create directory {}", self.dir.display()))?;
+        }
+        Ok(())
+    }
+
     // ── Key / crypto helpers ───────────────────────────────────────────
 
     fn load_identity(&self) -> Result<Identity> {
@@ -67,28 +79,54 @@ impl Store {
     fn encrypt(&self, plaintext: &str) -> Result<Vec<u8>> {
         let identity = self.load_identity()?;
         let recipient: Recipient = identity.to_public();
+        age_encrypt(&recipient as &dyn age::Recipient, plaintext.as_bytes())
+    }
 
-        let encryptor = Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))?;
-        let mut encrypted = Vec::new();
-        let mut writer = encryptor.wrap_output(&mut encrypted)?;
-        writer.write_all(plaintext.as_bytes())?;
-        writer.finish()?;
-        Ok(encrypted)
+    fn decrypt_file_to_string(&self, path: &Path) -> Result<String> {
+        let identity = self.load_identity()?;
+        let encrypted = fs::read(path)
+            .with_context(|| format!("Cannot read store at {}", path.display()))?;
+        let plaintext = age_decrypt(&identity as &dyn age::Identity, &encrypted)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt store: {e}"))?;
+        String::from_utf8(plaintext).context("Decrypted store is not valid UTF-8")
     }
 
     fn decrypt_to_string(&self) -> Result<String> {
-        let identity = self.load_identity()?;
-        let encrypted = fs::read(&self.store_path)
-            .with_context(|| format!("Cannot read store at {}", self.store_path.display()))?;
+        self.decrypt_file_to_string(&self.store_path)
+    }
 
-        let decryptor = Decryptor::new_buffered(&encrypted[..])
-            .map_err(|e| anyhow::anyhow!("Failed to create decryptor: {e}"))?;
-        let mut reader = decryptor
-            .decrypt(std::iter::once(&identity as &dyn age::Identity))
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt store: {e}"))?;
-        let mut plaintext = String::new();
-        reader.read_to_string(&mut plaintext)?;
-        Ok(plaintext)
+    /// Check that a file is an age ciphertext decryptable with the local identity.
+    pub fn verify_encrypted_file(&self, path: &Path) -> Result<()> {
+        self.decrypt_file_to_string(path).map(|_| ())
+    }
+
+    /// Encrypt the local key file with a passphrase (age scrypt) for remote backup.
+    pub fn export_key_encrypted(&self, passphrase: SecretString) -> Result<Vec<u8>> {
+        let key_bytes = fs::read(&self.key_path)
+            .with_context(|| format!("Cannot read key at {}", self.key_path.display()))?;
+        let recipient = age::scrypt::Recipient::new(passphrase);
+        age_encrypt(&recipient as &dyn age::Recipient, &key_bytes)
+    }
+
+    /// Decrypt a passphrase-protected key backup and install it as key.txt.
+    /// Refuses to overwrite an existing key.
+    pub fn import_key_encrypted(&self, ciphertext: &[u8], passphrase: SecretString) -> Result<()> {
+        if self.key_path.exists() {
+            bail!(
+                "A key already exists at {} — move it away first, then retry.",
+                self.key_path.display()
+            );
+        }
+        let identity = age::scrypt::Identity::new(passphrase);
+        let plaintext = age_decrypt(&identity as &dyn age::Identity, ciphertext)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt key backup (wrong passphrase?): {e}"))?;
+        let text = String::from_utf8(plaintext).context("Decrypted key is not valid UTF-8")?;
+        if !text.lines().any(|l| l.starts_with("AGE-SECRET-KEY-")) {
+            bail!("Decrypted backup contains no AGE-SECRET-KEY line — refusing to install");
+        }
+        self.ensure_dir()?;
+        write_private(&self.key_path, text.as_bytes())?;
+        Ok(())
     }
 
     // ── .env parsing / serialization ───────────────────────────────────
@@ -136,10 +174,11 @@ impl Store {
     fn save(&self, map: &BTreeMap<String, String>) -> Result<()> {
         let plaintext = Self::serialize(map);
         let encrypted = self.encrypt(&plaintext)?;
-        fs::write(&self.store_path, encrypted)
+        // Temp file + rename: a crash mid-write can never leave a truncated store.
+        let tmp = self.dir.join(format!("store.env.age.tmp-{}", std::process::id()));
+        write_private(&tmp, &encrypted)?;
+        fs::rename(&tmp, &self.store_path)
             .with_context(|| format!("Cannot write store to {}", self.store_path.display()))?;
-        // Ensure store file is only readable by owner
-        fs::set_permissions(&self.store_path, PermissionsExt::from_mode(0o600))?;
         Ok(())
     }
 
@@ -157,8 +196,7 @@ impl Store {
             bail!("Vault already initialized at {}", self.dir.display());
         }
 
-        fs::create_dir_all(&self.dir)
-            .with_context(|| format!("Cannot create directory {}", self.dir.display()))?;
+        self.ensure_dir()?;
 
         // Generate age identity
         let identity = Identity::generate();
@@ -170,8 +208,7 @@ impl Store {
             "# Vault age identity key — keep this secret!\n# public key: {recipient}\n{}\n",
             secret_key.expose_secret()
         );
-        fs::write(&self.key_path, key_content)?;
-        fs::set_permissions(&self.key_path, PermissionsExt::from_mode(0o600))?;
+        write_private(&self.key_path, key_content.as_bytes())?;
 
         // Create empty encrypted store
         self.save(&BTreeMap::new())?;
@@ -195,12 +232,17 @@ impl Store {
         let map = self.load()?;
         let content = Self::serialize(&map);
 
-        // Write to temp file with restricted permissions
-        let tmp = std::env::temp_dir().join(format!("vault-edit-{}.env", std::process::id()));
-        fs::write(&tmp, &content)?;
-        fs::set_permissions(&tmp, PermissionsExt::from_mode(0o600))?;
+        // Plaintext goes to XDG_RUNTIME_DIR when available: tmpfs, mode 0700,
+        // cleared on logout — nothing persists on disk or survives a crash.
+        let tmp_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let tmp = tmp_dir.join(format!("vault-edit-{}.env", std::process::id()));
+        write_private(&tmp, content.as_bytes())?;
+        let _guard = RemoveOnDrop(tmp.clone());
 
-        let original_content = content.clone();
+        let original_content = content;
 
         // Open $EDITOR (or $VISUAL, fallback vi)
         let editor = std::env::var("EDITOR")
@@ -216,16 +258,19 @@ impl Store {
             .with_context(|| format!("Failed to launch editor: {editor}"))?;
 
         if !status.success() {
-            let _ = fs::remove_file(&tmp);
             bail!("Editor exited with non-zero status");
         }
 
         let new_content = fs::read_to_string(&tmp)?;
-        let _ = fs::remove_file(&tmp);
 
         if new_content.trim() == original_content.trim() {
             eprintln!("No changes — store not updated.");
             return Ok(());
+        }
+
+        let dropped = Self::count_dropped_lines(&new_content);
+        if dropped > 0 {
+            eprintln!("⚠ {dropped} line(s) without KEY=VALUE were ignored and not saved.");
         }
 
         let new_map = Self::parse(&new_content);
@@ -235,8 +280,27 @@ impl Store {
         Ok(())
     }
 
+    /// Lines that are neither empty, comments, nor KEY=VALUE — parse() drops them.
+    fn count_dropped_lines(content: &str) -> usize {
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter(|l| match l.split_once('=') {
+                Some((key, _)) => key.trim().is_empty(),
+                None => true,
+            })
+            .count()
+    }
+
     pub fn add(&self, key: &str, value: Option<String>) -> Result<()> {
         self.ensure_init()?;
+
+        if !is_valid_env_key(key) {
+            bail!(
+                "Invalid key '{key}' — use letters, digits and underscores, not starting with a digit"
+            );
+        }
 
         let value = match value {
             Some(v) => v,
@@ -300,6 +364,10 @@ impl Store {
         }
         let map = self.load()?;
         for (key, value) in &map {
+            if !is_valid_env_key(key) {
+                eprintln!("⚠ Skipping '{key}' — not a valid environment variable name");
+                continue;
+            }
             println!("export {key}={}", shell_quote(value));
         }
         Ok(())
@@ -311,6 +379,62 @@ impl Store {
         print!("{plaintext}");
         Ok(())
     }
+}
+
+// ── File / crypto primitives ───────────────────────────────────────────
+
+/// Write a file that is owner-only (0600) from the moment it exists —
+/// avoids the write-then-chmod window where the default umask applies.
+/// Removing first drops any pre-planted file or symlink; create_new (O_EXCL)
+/// never follows symlinks.
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    let _ = fs::remove_file(path);
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("Cannot create {}", path.display()))?;
+    f.write_all(data)?;
+    Ok(())
+}
+
+/// Removes the wrapped path on drop — cleans up the plaintext temp file on
+/// every exit path of edit(), including errors.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Keys must be valid shell identifiers — `vault env` output is eval'd on
+/// shell startup, so anything else could smuggle shell syntax into it.
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn age_encrypt(recipient: &dyn age::Recipient, data: &[u8]) -> Result<Vec<u8>> {
+    let encryptor = Encryptor::with_recipients(std::iter::once(recipient))?;
+    let mut encrypted = Vec::new();
+    let mut writer = encryptor.wrap_output(&mut encrypted)?;
+    writer.write_all(data)?;
+    writer.finish()?;
+    Ok(encrypted)
+}
+
+fn age_decrypt(identity: &dyn age::Identity, ciphertext: &[u8]) -> Result<Vec<u8>> {
+    let decryptor = Decryptor::new_buffered(ciphertext)
+        .map_err(|e| anyhow::anyhow!("Not a valid age file: {e}"))?;
+    let mut reader = decryptor
+        .decrypt(std::iter::once(identity))
+        .map_err(|e| anyhow::anyhow!("Decryption failed: {e}"))?;
+    let mut plaintext = Vec::new();
+    reader.read_to_end(&mut plaintext)?;
+    Ok(plaintext)
 }
 
 /// Single-quote a string for safe shell usage.
@@ -379,5 +503,38 @@ mod tests {
         assert_eq!(map.get("BAZ").unwrap(), "qux");
         assert_eq!(map.get("EMPTY").unwrap(), "");
         assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn test_is_valid_env_key() {
+        assert!(is_valid_env_key("FOO"));
+        assert!(is_valid_env_key("_FOO"));
+        assert!(is_valid_env_key("TF_VAR_hcloud_token"));
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("1FOO"));
+        assert!(!is_valid_env_key("FOO-BAR"));
+        assert!(!is_valid_env_key("FOO BAR"));
+        assert!(!is_valid_env_key("FOO$(x)"));
+        assert!(!is_valid_env_key("FOO;rm"));
+    }
+
+    #[test]
+    fn test_count_dropped_lines() {
+        let content = "FOO=bar\n# comment\n\noops no equals\n=no key\nBAZ=qux\n";
+        assert_eq!(Store::count_dropped_lines(content), 2);
+        assert_eq!(Store::count_dropped_lines("FOO=bar\n"), 0);
+    }
+
+    #[test]
+    fn test_scrypt_roundtrip() {
+        let recipient = age::scrypt::Recipient::new(String::from("test-pass").into());
+        let ct = age_encrypt(&recipient as &dyn age::Recipient, b"AGE-SECRET-KEY-TEST").unwrap();
+
+        let identity = age::scrypt::Identity::new(String::from("test-pass").into());
+        let pt = age_decrypt(&identity as &dyn age::Identity, &ct).unwrap();
+        assert_eq!(pt, b"AGE-SECRET-KEY-TEST");
+
+        let wrong = age::scrypt::Identity::new(String::from("wrong").into());
+        assert!(age_decrypt(&wrong as &dyn age::Identity, &ct).is_err());
     }
 }

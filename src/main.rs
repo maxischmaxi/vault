@@ -75,6 +75,10 @@ enum Commands {
         remote: String,
     },
 
+    /// Manage the age identity key
+    #[command(subcommand)]
+    Key(KeyCmd),
+
     /// Generate shell completion script
     Completions {
         /// Shell to generate completions for
@@ -116,6 +120,15 @@ enum RemoteCmd {
     Rm {
         /// Remote name to remove
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Restore key.txt from a remote key backup (pushed with `vault push --include-key`)
+    Restore {
+        /// Remote name to restore from
+        remote: String,
     },
 }
 
@@ -164,7 +177,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Cat => store.cat()?,
         Commands::Remote(cmd) => {
             // Ensure vault dir exists so remotes.toml can be written.
-            std::fs::create_dir_all(store.dir())?;
+            store.ensure_dir()?;
             let mgr = remote::RemoteManager::new(store.remotes_config_path());
             handle_remote(mgr, store.dir(), cmd)?;
         }
@@ -172,14 +185,42 @@ fn main() -> anyhow::Result<()> {
         Commands::Push { remote, include_key } => {
             store.ensure_init()?;
             let mgr = remote::RemoteManager::new(store.remotes_config_path());
-            handle_push(mgr, store.store_path(), store.key_path(), remote, include_key)?;
+            handle_push(mgr, &store, remote, include_key)?;
         }
 
         Commands::Pull { remote } => {
             store.ensure_init()?;
             let mgr = remote::RemoteManager::new(store.remotes_config_path());
             let r = mgr.find(&remote)?;
-            remote::pull(&r, store.store_path())?;
+            // Download lands in a temp file; the local store is only replaced
+            // once the pulled data provably decrypts with the local key.
+            let tmp = remote::pull(&r, store.store_path())?;
+            if let Err(e) = store.verify_encrypted_file(&tmp) {
+                let _ = std::fs::remove_file(&tmp);
+                bail!(
+                    "Pulled store from '{remote}' cannot be decrypted with the local key — local store left unchanged.\n  {e}"
+                );
+            }
+            std::fs::rename(&tmp, store.store_path())?;
+            eprintln!(
+                "✓ Pulled encrypted store from '{remote}' → {}",
+                store.store_path().display()
+            );
+        }
+
+        Commands::Key(KeyCmd::Restore { remote }) => {
+            if store.key_path().exists() {
+                bail!(
+                    "A key already exists at {} — refusing to overwrite it.\n  Move it away first if you really want to replace it.",
+                    store.key_path().display()
+                );
+            }
+            let mgr = remote::RemoteManager::new(store.remotes_config_path());
+            let r = mgr.find(&remote)?;
+            let ciphertext = remote::pull_key(&r)?;
+            let passphrase = prompt_passphrase("Enter key backup passphrase: ")?;
+            store.import_key_encrypted(&ciphertext, passphrase)?;
+            eprintln!("✓ Restored age key to {}", store.key_path().display());
         }
 
         Commands::Completions { .. } => unreachable!(),
@@ -212,6 +253,10 @@ fn patch_zsh_remote_completion(s: String) -> String {
     let s = s.replace(
         ":remote -- Remote name to pull from:_default'",
         ":remote -- Remote name to pull from:_vault_remote_names'",
+    );
+    let s = s.replace(
+        ":remote -- Remote name to restore from:_default'",
+        ":remote -- Remote name to restore from:_vault_remote_names'",
     );
 
     // Inject the helper function near the top, after the initial header line.
@@ -272,8 +317,7 @@ fn handle_remote(
 
 fn handle_push(
     mgr: remote::RemoteManager,
-    store_path: &std::path::Path,
-    key_path: &std::path::Path,
+    store: &store::Store,
     name: Option<String>,
     include_key: bool,
 ) -> anyhow::Result<()> {
@@ -288,9 +332,20 @@ fn handle_push(
         }
     };
 
+    // The key never leaves the machine in plaintext: encrypt it once with a
+    // passphrase (age scrypt), then upload the same ciphertext to each remote.
+    let key_ciphertext = if include_key {
+        eprintln!("The age key will be encrypted with a passphrase before upload.");
+        eprintln!("You need this passphrase to restore it with `vault key restore`.");
+        let passphrase = prompt_new_passphrase()?;
+        Some(store.export_key_encrypted(passphrase)?)
+    } else {
+        None
+    };
+
     let mut errors = Vec::new();
     for r in &remotes {
-        if let Err(e) = remote::push(r, store_path, key_path, include_key) {
+        if let Err(e) = remote::push(r, store.store_path(), key_ciphertext.as_deref()) {
             errors.push((r.name.clone(), e));
         }
     }
@@ -302,6 +357,30 @@ fn handle_push(
         bail!("{} remote(s) failed", errors.len());
     }
     Ok(())
+}
+
+fn prompt_passphrase(prompt: &str) -> anyhow::Result<age::secrecy::SecretString> {
+    use std::io::Write;
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    Ok(rpassword::read_password()?.into())
+}
+
+fn prompt_new_passphrase() -> anyhow::Result<age::secrecy::SecretString> {
+    use std::io::Write;
+    eprint!("Enter passphrase for key backup: ");
+    std::io::stderr().flush()?;
+    let first = rpassword::read_password()?;
+    eprint!("Confirm passphrase: ");
+    std::io::stderr().flush()?;
+    let second = rpassword::read_password()?;
+    if first.is_empty() {
+        bail!("Passphrase must not be empty");
+    }
+    if first != second {
+        bail!("Passphrases do not match");
+    }
+    Ok(first.into())
 }
 
 fn port_label(port: Option<u16>) -> String {
